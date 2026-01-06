@@ -1,0 +1,589 @@
+---
+title: "Final Project"
+author: "Nasrin Khanam"
+date: "2025-12-04"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+```{r}
+library(modelsummary)
+library(broom)
+library(kableExtra)
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(janitor)
+library(stringr)
+library(purrr)
+library(ggplot2)
+library(scales)
+library(lmtest)
+library(sandwich)
+library(car)       
+library(broom)
+library(modelsummary)
+library(kableExtra)
+
+
+
+setwd("/Users/Nasrinkhanam/Downloads/FinalProject")
+
+native_files <- c("Native_Load_2018.xlsx","Native_Load_2019.xlsx","Native_Load_2020.xlsx")
+gen_files <- c("IntGenbyFuel2018.xlsx","IntGenbyFuel2019.xlsx","IntGenbyFuel2020.xlsx")
+
+
+#Native load 
+read_native <- function(file) {
+  read_excel(file) %>%
+    clean_names() %>%
+    select(hour_ending, ercot) %>%
+    mutate(
+      hour = parse_date_time(
+        hour_ending,
+        orders = c("mdY HM", "mdY HMS"),
+        tz = "America/Chicago"
+      )
+    ) %>%
+    filter(!is.na(hour)) %>%
+    transmute(
+      hour = floor_date(hour, "hour"),
+      load_ercot = as.numeric(ercot)
+    ) %>%
+    group_by(hour) %>%
+    summarise(load_ercot = mean(load_ercot, na.rm = TRUE), .groups = "drop")
+}
+
+native_all <- map_dfr(native_files, read_native) %>%
+  arrange(hour)
+
+#IntGenbyFuel (15-min -> hourly)
+#detect time columns after clean_names()
+find_time_cols <- function(df) {
+  nms <- names(df)
+  which(str_detect(nms, "^x?\\d{1,2}_\\d{2}$"))
+}
+
+is_month_sheet <- function(sh) {
+  str_detect(tolower(sh), "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec")
+}
+
+read_gen_file <- function(file) {
+  sheets <- excel_sheets(file)
+  month_sheets <- sheets[map_lgl(sheets, is_month_sheet)]
+
+  map_dfr(month_sheets, function(sh) {
+
+    df <- read_excel(file, sheet = sh, col_names = TRUE) %>%
+      clean_names()
+
+    time_idx <- find_time_cols(df)
+    if (length(time_idx) == 0) return(tibble())
+
+    df %>%
+      rename(date = 1, fuel = 2) %>%
+      pivot_longer(
+        cols = all_of(names(df)[time_idx]),
+        names_to = "time_15",
+        values_to = "mw"
+      ) %>%
+      mutate(
+        date = as.Date(date),
+        time_15 = str_remove(time_15, "^x"),
+        time_15 = str_replace(time_15, "_", ":"),
+        dt_15 = ymd(date, tz = "America/Chicago") + hm(time_15),
+        hour = floor_date(dt_15, "hour"),
+        mw = as.numeric(mw),
+        fuel = str_squish(as.character(fuel))
+      ) %>%
+      filter(!is.na(hour), !is.na(mw), !is.na(fuel)) %>%
+      group_by(hour, fuel) %>%
+      summarise(gen_mw = mean(mw, na.rm = TRUE), .groups = "drop")
+  })
+}
+
+gen_hourly_long <- map_dfr(gen_files, read_gen_file)
+
+# sanity checks
+head(gen_hourly_long)
+sort(unique(gen_hourly_long$fuel))
+
+# wide hourly generation
+gen_wide <- gen_hourly_long %>%
+  pivot_wider(names_from = fuel, values_from = gen_mw) %>%
+  arrange(hour)
+
+#merge
+
+common_min <- max(min(native_all$hour, na.rm = TRUE), min(gen_wide$hour, na.rm = TRUE))
+common_max <- min(max(native_all$hour, na.rm = TRUE), max(gen_wide$hour, na.rm = TRUE))
+
+native_all <- native_all %>%
+  filter(hour >= common_min, hour <= common_max) %>%
+  arrange(hour)
+
+gen_wide <- gen_wide %>%
+  filter(hour >= common_min, hour <= common_max) %>%
+  arrange(hour)
+
+ercot_hourly <- native_all %>%
+  left_join(gen_wide, by = "hour") %>%
+  arrange(hour)
+
+# add totals 
+ercot_hourly <- ercot_hourly %>%
+  mutate(
+    gas_total    = coalesce(Gas, 0) + coalesce(`Gas-CC`, 0),
+    fossil_total = gas_total + coalesce(Coal, 0),
+    renew_total  = coalesce(Wind, 0) + coalesce(Solar, 0) + coalesce(Hydro, 0) + coalesce(Biomass, 0)
+  )
+
+# drop rows missing key vars 
+ercot_hourly <- ercot_hourly %>%
+  filter(!is.na(load_ercot), !is.na(Wind), !is.na(Coal)) %>%
+  filter(!is.na(gas_total))
+
+head(ercot_hourly)
+
+ercot_hourly %>%
+  summarise(
+    corr_wind_demand = cor(Wind, load_ercot, use = "complete.obs"),
+    corr_wind_gas    = cor(Wind, gas_total,  use = "complete.obs"),
+    corr_wind_coal   = cor(Wind, Coal,       use = "complete.obs")
+  )
+
+
+#summary stats
+#fuel shares
+ercot_hourly %>%
+  summarise(
+    wind_share   = mean(Wind / load_ercot, na.rm = TRUE),
+    gas_share    = mean(gas_total / load_ercot, na.rm = TRUE),
+    coal_share   = mean(Coal / load_ercot, na.rm = TRUE),
+    renew_share  = mean(renew_total / load_ercot, na.rm = TRUE)
+  )
+
+#means of gas when wind is high vs low
+ercot_hourly %>%
+  mutate(wind_quartile = ntile(Wind, 4)) %>%
+  group_by(wind_quartile) %>%
+  summarise(
+    avg_wind = mean(Wind, na.rm = TRUE),
+    avg_gas_total = mean(gas_total, na.rm = TRUE),
+    avg_coal = mean(Coal, na.rm = TRUE),
+    avg_load = mean(load_ercot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+#dynamics for time of day
+ercot_hourly %>%
+  filter(!is.na(Wind), !is.na(Gas), !is.na(Coal)) %>%
+  mutate(hour_of_day = hour(hour)) %>%
+  group_by(hour_of_day) %>%
+  summarise(
+    wind = mean(Wind),
+    gas  = mean(Gas),
+    coal = mean(Coal),
+    .groups = "drop"
+  )
+
+#wind volatility
+ercot_hourly %>%
+  summarise(
+    cv_wind = sd(Wind, na.rm = TRUE) / mean(Wind, na.rm = TRUE),
+    cv_gas  = sd(Gas,  na.rm = TRUE) / mean(Gas,  na.rm = TRUE),
+    cv_coal = sd(Coal, na.rm = TRUE) / mean(Coal, na.rm = TRUE)
+  )
+
+summary_table <- ercot_hourly %>%
+  summarise(
+    Mean_Wind_MWh   = mean(Wind, na.rm = TRUE),
+    SD_Wind_MWh     = sd(Wind, na.rm = TRUE),
+    Mean_Gas_MWh    = mean(gas_total, na.rm = TRUE),
+    SD_Gas_MWh      = sd(gas_total, na.rm = TRUE),
+    Mean_Coal_MWh   = mean(Coal, na.rm = TRUE),
+    SD_Coal_MWh     = sd(Coal, na.rm = TRUE),
+    Mean_Load_MWh   = mean(load_ercot, na.rm = TRUE),
+    SD_Load_MWh     = sd(load_ercot, na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Statistic",
+    values_to = "Value"
+  )
+
+summary_table %>%
+  kbl(
+    caption = "Table 1: Summary Statistics of ERCOT Electricity Generation (2018–2020)",
+    digits = 2
+  ) %>%
+  kable_styling(full_width = FALSE)
+
+fuel_share_table <- ercot_hourly %>%
+  summarise(
+    Wind_Share  = mean(Wind / load_ercot, na.rm = TRUE),
+    Gas_Share   = mean(gas_total / load_ercot, na.rm = TRUE),
+    Coal_Share  = mean(Coal / load_ercot, na.rm = TRUE),
+    Renew_Share = mean(renew_total / load_ercot, na.rm = TRUE)
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = "Fuel Type",
+    values_to = "Average Share"
+  )
+
+fuel_share_table %>%
+  kbl(
+    caption = "Table 2: Average Generation Shares by Fuel Type",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE)
+
+quartile_table <- ercot_hourly %>%
+  mutate(wind_quartile = ntile(Wind, 4)) %>%
+  group_by(wind_quartile) %>%
+  summarise(
+    Avg_Wind_MWh = mean(Wind, na.rm = TRUE),
+    Avg_Gas_MWh  = mean(gas_total, na.rm = TRUE),
+    Avg_Coal_MWh = mean(Coal, na.rm = TRUE),
+    Avg_Load_MWh = mean(load_ercot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+quartile_table %>%
+  kbl(
+    caption = "Table 3: Average Generation by Wind Output Quartile",
+    digits = 1
+  ) %>%
+  kable_styling(full_width = FALSE)
+
+correlation_table <- tibble(
+  Variable_Pair = c(
+    "Wind & Demand",
+    "Wind & Gas Generation",
+    "Wind & Coal Generation"
+  ),
+  Correlation = c(
+    cor(ercot_hourly$Wind, ercot_hourly$load_ercot, use = "complete.obs"),
+    cor(ercot_hourly$Wind, ercot_hourly$gas_total,  use = "complete.obs"),
+    cor(ercot_hourly$Wind, ercot_hourly$Coal,       use = "complete.obs")
+  )
+)
+
+correlation_table %>%
+  kbl(
+    caption = "Table 4: Correlations Between Wind Output and Electricity Generation",
+    digits = 3
+  ) %>%
+  kable_styling(full_width = FALSE)
+
+#PLOTS
+fig3_df <- ercot_hourly %>%
+  mutate(hour_of_day = hour(hour)) %>%
+  group_by(hour_of_day) %>%
+  summarise(
+    wind_mwh   = mean(Wind, na.rm = TRUE),
+    demand_mwh = mean(load_ercot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# scale demand to wind axis so we can use a secondary axis
+scale_hour <- max(fig3_df$wind_mwh, na.rm = TRUE) / max(fig3_df$demand_mwh, na.rm = TRUE)
+
+ggplot(fig3_df, aes(x = hour_of_day)) +
+  geom_line(aes(y = wind_mwh, color = "Wind Output (MWh)"), linewidth = 1) +
+  geom_line(aes(y = demand_mwh * scale_hour, color = "Demand (MWh)"), linewidth = 1) +
+  scale_color_manual(
+    values = c("Demand (MWh)" = "brown1", "Wind Output (MWh)" = "steelblue1")
+  ) +
+  scale_y_continuous(
+    name = "Wind Output (MWh)",
+    sec.axis = sec_axis(~ . / scale_hour, name = "Demand (MWh)")
+  ) +
+  scale_x_continuous(
+    limits = c(3, 21),                 
+    breaks = seq(4, 20, by = 4)
+  ) +
+  labs(
+    title = "Average Hourly Wind Production and Electricity Demand",
+    x = "Time of Day",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+fig4_df <- ercot_hourly %>%
+  mutate(month_num = month(hour)) %>%
+  group_by(month_num) %>%
+  summarise(
+    wind_mwh   = mean(Wind, na.rm = TRUE),
+    demand_mwh = mean(load_ercot, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+scale_month <- max(fig4_df$wind_mwh, na.rm = TRUE) /
+               max(fig4_df$demand_mwh, na.rm = TRUE)
+
+ggplot(fig4_df, aes(x = month_num)) +
+  geom_line(
+    aes(y = wind_mwh, color = "Wind Output (MWh)"),
+    linewidth = 1,
+    linetype = "dashed"
+  ) +
+  geom_line(
+    aes(y = demand_mwh * scale_month, color = "Demand (MWh)"),
+    linewidth = 1
+  ) +
+  scale_color_manual(
+    values = c("Demand (MWh)" = "brown1",
+               "Wind Output (MWh)" = "steelblue1")
+  ) +
+  scale_y_continuous(
+    name = "Wind Output (MWh)",
+    sec.axis = sec_axis(~ . / scale_month, name = "Demand (MWh)")
+  ) +
+  scale_x_continuous(
+    breaks = 1:12,
+    labels = 1:12
+  ) +
+  labs(
+    title = "Average Monthly Wind Production and Electricity Demand",
+    x = "Months",
+    color = NULL
+  ) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "bottom"
+  )
+
+# regression-ready dataset
+ercot_reg <- ercot_hourly %>%
+  mutate(
+    date = as.Date(hour),
+    hour_of_day = hour(hour),
+    dow = wday(hour, label = TRUE),
+    month = month(hour),
+    year = year(hour),
+    gas_total = coalesce(Gas, 0) + coalesce(`Gas-CC`, 0),
+    fossil_total = gas_total + coalesce(Coal, 0),
+    wind_sq = Wind^2,
+    load_sq = load_ercot^2
+  ) %>%
+  arrange(hour)
+
+ercot_reg <- ercot_reg %>%
+  mutate(
+    total_gen = coalesce(Biomass, 0) + coalesce(Coal, 0) +
+                coalesce(Gas, 0) + coalesce(`Gas-CC`, 0) +
+                coalesce(Hydro, 0) + coalesce(Nuclear, 0) +
+                coalesce(Other, 0) + coalesce(Solar, 0) +
+                coalesce(Wind, 0),
+    net_imports = load_ercot - total_gen
+  )
+
+# lags helper 
+make_lags <- function(df, var, lags) {
+  for (L in lags) {
+    df[[paste0(var, "_L", L)]] <- dplyr::lag(df[[var]], L)
+  }
+  df
+}
+
+#make lags + drop missing lag rows
+ercot_reg <- ercot_reg %>%
+  make_lags("Wind", 1:25) %>%
+  make_lags("load_ercot", 1:25) %>%
+  filter(!is.na(Wind_L25), !is.na(load_ercot_L25))
+
+#Power offsets
+fit_static_dynamic <- function(depvar, data) {
+
+  f_static <- as.formula(paste0(
+    depvar, " ~ Wind + wind_sq + load_ercot + load_sq + ",
+    "factor(hour_of_day) + factor(dow) + factor(month) + factor(year)"
+  ))
+
+  f_dynamic <- as.formula(paste0(
+    depvar, " ~ Wind + wind_sq + load_ercot + load_sq + ",
+    "Wind_L1 + Wind_L2 + Wind_L3 + Wind_L4 + Wind_L5 + Wind_L6 + Wind_L12 + Wind_L24 + ",
+    "load_ercot_L1 + load_ercot_L2 + load_ercot_L3 + load_ercot_L4 + load_ercot_L5 + load_ercot_L6 + load_ercot_L12 + load_ercot_L24 + ",
+    "factor(hour_of_day) + factor(dow) + factor(month) + factor(year)"
+  ))
+
+  list(
+    static  = lm(f_static,  data = data),
+    dynamic = lm(f_dynamic, data = data)
+  )
+}
+get_wind_cell <- function(model, lag_nw = 24) {
+  ct <- lmtest::coeftest(
+    model,
+    vcov. = sandwich::NeweyWest(model, lag = lag_nw, prewhite = FALSE)
+  )
+  est <- ct["Wind", "Estimate"]
+  se  <- ct["Wind", "Std. Error"]
+  sprintf("%.3f (%.3f)", est, se)
+}
+
+fuel_map <- c(
+  "Coal"     = "Coal",
+  "All gas"  = "gas_total",
+  "Nuclear"  = "Nuclear",
+  "Hydro"    = "Hydro",
+  "Imports*" = "net_imports"
+)
+
+offset_table <- purrr::imap_dfr(fuel_map, function(depvar, fuel_label) {
+
+  models <- fit_static_dynamic(depvar, ercot_reg)
+
+  tibble(
+    Fuel   = fuel_label,
+    Static = get_wind_cell(models$static),
+    Dynamic = get_wind_cell(models$dynamic)
+  )
+})
+
+View(offset_table)
+
+offset_table %>%
+  kableExtra::kbl(
+    caption = "Table 5: Power Offsets by Technology: Static and Dynamic Models",
+    align = "lcc"
+  ) %>%
+  kableExtra::kable_styling(full_width = FALSE)
+
+
+#Static model
+m_static <- lm(
+  fossil_total ~ Wind + wind_sq + load_ercot + load_sq +
+    factor(hour_of_day) + factor(dow) + factor(month) + factor(year),
+  data = ercot_reg
+)
+
+#Dynamic model
+m_dynamic <- lm(
+  fossil_total ~ Wind + wind_sq + load_ercot + load_sq +
+    Wind_L1 + Wind_L2 + Wind_L3 + Wind_L6 + Wind_L12 + Wind_L24 +
+    load_ercot_L1 + load_ercot_L2 + load_ercot_L3 + load_ercot_L6 + load_ercot_L12 + load_ercot_L24 +
+    factor(hour_of_day) + factor(dow) + factor(month) + factor(year),
+  data = ercot_reg
+)
+
+#Date fixed effects
+m_dateFE <- lm(
+  fossil_total ~ Wind + wind_sq + load_ercot + load_sq +
+    factor(hour_of_day) + factor(date),
+  data = ercot_reg
+)
+
+#SE choices 
+vcovs_main <- list(
+  "Static (NW SE)" = NeweyWest(m_static, lag = 24, prewhite = FALSE),
+  "Dynamic (NW SE)" = NeweyWest(m_dynamic, lag = 24, prewhite = FALSE),
+  "Date FE (Cluster Date)" = vcovCL(m_dateFE, cluster = ~date)
+)
+
+models_main <- list(
+  "Static (NW SE)" = m_static,
+  "Dynamic (NW SE)" = m_dynamic,
+  "Date FE (Cluster Date)" = m_dateFE
+)
+
+#coefficient labels 
+coef_map <- c(
+  "Wind" = "Wind Output (MWh)",
+  "wind_sq" = "Wind Output^2",
+  "load_ercot" = "Demand (MWh)",
+  "load_sq" = "Demand^2",
+
+  "Wind_L1"  = "Wind (t-1)",
+  "Wind_L2"  = "Wind (t-2)",
+  "Wind_L3"  = "Wind (t-3)",
+  "Wind_L6"  = "Wind (t-6)",
+  "Wind_L12" = "Wind (t-12)",
+  "Wind_L24" = "Wind (t-24)",
+
+  "load_ercot_L1"  = "Demand (t-1)",
+  "load_ercot_L2"  = "Demand (t-2)",
+  "load_ercot_L3"  = "Demand (t-3)",
+  "load_ercot_L6"  = "Demand (t-6)",
+  "load_ercot_L12" = "Demand (t-12)",
+  "load_ercot_L24" = "Demand (t-24)"
+)
+
+reg_viewer_tbl <- modelsummary(
+  models_main,
+  vcov = vcovs_main,
+  coef_map = coef_map,
+  coef_omit = "factor\\(hour_of_day\\)|factor\\(dow\\)|factor\\(month\\)|factor\\(year\\)|factor\\(date\\)",
+  statistic = "({std.error})",
+  stars = c('*' = .10, '**' = .05, '***' = .01),
+  gof_map = c(
+    "nobs" = "Observations",
+    "r.squared" = "R-squared"
+  ),
+  output = "kableExtra"
+)
+
+reg_viewer_tbl %>%
+  add_header_above(c(" " = 1, "Table 6: Fossil Generation (MWh)" = 3)) %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center") %>%
+  footnote(
+    general = "Newey-West standard errors in parentheses. Date fixed effects clustered by day.",
+    general_title = "Notes:"
+  )
+
+#Joint Test
+
+linearHypothesis(
+  m_dateFE,
+  c("Wind = 0", "wind_sq = 0"),
+  vcov = vcovCL(m_dateFE, cluster = ~date)
+)
+
+#gas & coal substitution tables 
+
+m_gas <- lm(
+  gas_total ~ Wind + wind_sq + load_ercot + load_sq + factor(hour_of_day) + factor(date),
+  data = ercot_reg
+)
+
+m_coal <- lm(
+  Coal ~ Wind + wind_sq + load_ercot + load_sq + factor(hour_of_day) + factor(date),
+  data = ercot_reg
+)
+
+sub_models <- list("Gas (Date FE)" = m_gas, "Coal (Date FE)" = m_coal)
+sub_vcovs  <- list(
+  "Gas (Date FE)"  = vcovCL(m_gas, cluster = ~date),
+  "Coal (Date FE)" = vcovCL(m_coal, cluster = ~date)
+)
+
+sub_tbl <- modelsummary(
+  sub_models,
+  vcov = sub_vcovs,
+  coef_map = coef_map,
+  coef_omit = "factor\\(hour_of_day\\)|factor\\(date\\)",
+  statistic = "({std.error})",
+  stars = c('*' = .10, '**' = .05, '***' = .01),
+  gof_map = c("nobs" = "Observations", "r.squared" = "R-squared"),
+  title = "Table 7: Wind Substitution Effects: Gas vs. Coal (Date Fixed Effects)",
+  output = "kableExtra"
+)
+
+sub_tbl %>%
+  kableExtra::kable_styling(full_width = FALSE, position = "center")
+
+write.csv(ercot_reg, "ercot_reg_2018_2020.csv", row.names = FALSE)
+
+```
+
+
